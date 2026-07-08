@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>solver</title>
+<style>
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; height:100%; width:100%;
+    background:#000; overflow:hidden;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  #app{
+    position:relative; width:100vw; height:100vh; height:100dvh;
+    background:#000;
+  }
+  video{
+    position:absolute; inset:0; width:100%; height:100%;
+    object-fit:contain; background:#000;
+  }
+  canvas{display:none;}
+
+  #status{
+    position:absolute; top:8px; left:8px; right:150px;
+    font-size:11px; color:#aaa; background:#000;
+    padding:3px 6px; z-index:5;
+    white-space:pre-wrap; word-break:break-word;
+  }
+
+  #controls{
+    position:absolute; top:8px; right:8px;
+    display:flex; gap:6px; z-index:6;
+  }
+  button{
+    font-family:inherit; font-size:11px; color:#fff;
+    background:#000; border:1px solid #555;
+    padding:5px 8px; cursor:pointer;
+  }
+  button.active{ border-color:#fff; }
+  button:active{ background:#222; }
+
+  .hover-label{
+    position:absolute; z-index:4;
+    background:#000; color:#fff;
+    border:1px solid #fff;
+    font-size:12px; line-height:1.3;
+    padding:2px 5px;
+    max-width:70%;
+    white-space:pre-wrap;
+    pointer-events:none;
+    transform:translateY(-100%);
+  }
+
+  #permission, #settingsScreen{
+    position:absolute; inset:0; z-index:20;
+    background:#000; color:#fff;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    text-align:center; padding:24px; gap:10px;
+  }
+  #permission h1, #settingsScreen h1{ font-size:14px; margin:0; }
+  #permission p, #settingsScreen p{ font-size:12px; color:#999; max-width:340px; margin:0; line-height:1.5; }
+  #permission button, #settingsScreen button{ margin-top:6px; padding:8px 16px; }
+  #permission.hidden, #settingsScreen.hidden{ display:none; }
+  #permErr{ color:#f66; font-size:12px; }
+
+  .field{ display:flex; flex-direction:column; gap:4px; align-items:flex-start; width:280px; max-width:80vw; }
+  .field label{ font-size:10px; color:#999; text-transform:uppercase; letter-spacing:0.05em; }
+  .field input{
+    font-family:inherit; font-size:12px; color:#fff; background:#000;
+    border:1px solid #555; padding:8px; width:100%;
+  }
+  #settingsErr{ font-size:11px; color:#f66; min-height:14px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="status">idle</div>
+
+  <div id="overlayLayer"></div>
+
+  <div id="controls">
+    <button id="liveToggle">live: off</button>
+    <button id="camToggle">flip</button>
+    <button id="settingsBtn">settings</button>
+  </div>
+
+  <div id="settingsScreen">
+    <h1>ollama connection</h1>
+    <p>this calls Ollama running on your laptop over your local WiFi. install Ollama, run <code>ollama pull llava</code>, then start it with <code>OLLAMA_HOST=0.0.0.0:11434 OLLAMA_ORIGINS=* ollama serve</code> so your phone can reach it. find your laptop's local IP (e.g. 192.168.1.23) and enter it below.</p>
+    <div class="field">
+      <label>server url</label>
+      <input id="serverInput" type="text" placeholder="http://192.168.1.23:11434" autocomplete="off" autocapitalize="off" spellcheck="false" />
+    </div>
+    <div class="field">
+      <label>model name</label>
+      <input id="modelInput" type="text" placeholder="llava" autocomplete="off" autocapitalize="off" spellcheck="false" />
+    </div>
+    <div id="settingsErr"></div>
+    <button id="saveSettingsBtn">save</button>
+  </div>
+
+  <div id="permission" class="hidden">
+    <h1>solver</h1>
+    <p>point camera at a problem. it solves continuously and shows the answer over it.</p>
+    <button id="startBtn">enable camera</button>
+    <p id="permErr"></p>
+  </div>
+</div>
+
+<script>
+(function(){
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusEl = document.getElementById('status');
+  const overlayLayer = document.getElementById('overlayLayer');
+  const liveToggle = document.getElementById('liveToggle');
+  const camToggle = document.getElementById('camToggle');
+  const settingsBtn = document.getElementById('settingsBtn');
+  const permission = document.getElementById('permission');
+  const startBtn = document.getElementById('startBtn');
+  const permErr = document.getElementById('permErr');
+  const settingsScreen = document.getElementById('settingsScreen');
+  const serverInput = document.getElementById('serverInput');
+  const modelInput = document.getElementById('modelInput');
+  const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+  const settingsErr = document.getElementById('settingsErr');
+
+  let stream = null;
+  let facingMode = 'environment';
+  let busy = false;
+  let live = false;
+  let loopTimer = null;
+
+  let serverUrl = localStorage.getItem('solver_ollama_url') || '';
+  let modelName = localStorage.getItem('solver_ollama_model') || 'llava';
+
+  function setStatus(t){ statusEl.textContent = t; }
+
+  function showSettings(){
+    serverInput.value = serverUrl;
+    modelInput.value = modelName;
+    settingsScreen.classList.remove('hidden');
+    permission.classList.add('hidden');
+  }
+  function showPermission(){
+    settingsScreen.classList.add('hidden');
+    permission.classList.remove('hidden');
+  }
+
+  saveSettingsBtn.addEventListener('click', ()=>{
+    let v = serverInput.value.trim().replace(/\/$/,'');
+    const m = modelInput.value.trim() || 'llava';
+    if(!/^https?:\/\/.+/.test(v)){
+      settingsErr.textContent = 'enter a full url, e.g. http://192.168.1.23:11434';
+      return;
+    }
+    serverUrl = v;
+    modelName = m;
+    localStorage.setItem('solver_ollama_url', serverUrl);
+    localStorage.setItem('solver_ollama_model', modelName);
+    settingsErr.textContent = '';
+    showPermission();
+  });
+
+  settingsBtn.addEventListener('click', showSettings);
+
+  // boot sequence
+  if(!serverUrl){
+    showSettings();
+  } else {
+    showPermission();
+  }
+
+  async function startCamera(){
+    permErr.textContent = '';
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      permErr.textContent = 'camera API unavailable — must be loaded over https (or localhost), not a bare local file.';
+      return;
+    }
+    try{
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video:{ facingMode:{ ideal:facingMode }, width:{ideal:1280}, height:{ideal:1280} },
+        audio:false
+      });
+      video.srcObject = stream;
+      permission.classList.add('hidden');
+      setStatus('idle');
+    }catch(e){
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+        video.srcObject = stream;
+        permission.classList.add('hidden');
+        setStatus('idle');
+      }catch(e2){
+        permErr.textContent = e2.name + ': ' + e2.message;
+      }
+    }
+  }
+  startBtn.addEventListener('click', startCamera);
+
+  camToggle.addEventListener('click', ()=>{
+    facingMode = facingMode === 'environment' ? 'user' : 'environment';
+    startCamera();
+  });
+
+  function captureFrame(){
+    const w = video.videoWidth, h = video.videoHeight;
+    if(!w || !h) return null;
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, w, h);
+    return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+  }
+
+  function getVideoRect(){
+    const cw = video.clientWidth, ch = video.clientHeight;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if(!vw || !vh) return {dx:0,dy:0,dw:cw,dh:ch};
+    const scale = Math.min(cw/vw, ch/vh);
+    const dw = vw*scale, dh = vh*scale;
+    return { dx:(cw-dw)/2, dy:(ch-dh)/2, dw, dh };
+  }
+
+  function clearOverlay(){ overlayLayer.innerHTML = ''; }
+
+  function renderOverlay(item){
+    clearOverlay();
+    if(!item || !item.found) return;
+    const r = getVideoRect();
+    const el = document.createElement('div');
+    el.className = 'hover-label';
+    el.textContent = item.answer;
+    el.style.left = (r.dx + item.x * r.dw) + 'px';
+    el.style.top = (r.dy + item.y * r.dh) + 'px';
+    overlayLayer.appendChild(el);
+  }
+
+  function parseJson(text){
+    text = text.trim();
+    text = text.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+    // some local models wrap JSON in extra prose; try to pull out the first {...} block
+    const match = text.match(/\{[\s\S]*\}/);
+    if(match) text = match[0];
+    try{ return JSON.parse(text); }catch(e){ return null; }
+  }
+
+  async function solveOnce(){
+    if(busy) return;
+    if(!serverUrl){ setStatus('no ollama server set — tap "settings"'); return; }
+    const img = captureFrame();
+    if(!img) return;
+    busy = true;
+    setStatus('solving...');
+    try{
+      const res = await fetch(serverUrl + '/api/chat', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({
+          model: modelName,
+          stream: false,
+          format: 'json',
+          messages:[{
+            role:'user',
+            content:
+              "Find the single clearest academic problem (math/science/reading/etc) visible in the image. " +
+              "Reply with ONLY raw JSON, no markdown, no extra text, in exactly this shape: " +
+              '{"found":true,"x":0.0,"y":0.0,"answer":"short final answer, under 8 words"} ' +
+              "x and y are the fraction (0 to 1) of image width/height for the TOP-LEFT corner of the problem. " +
+              'If no legible problem is visible, reply {"found":false,"x":0,"y":0,"answer":""}',
+            images: [img]
+          }]
+        })
+      });
+
+      if(!res.ok){
+        const errBody = await res.text();
+        setStatus('server error ' + res.status + ': ' + errBody.slice(0,150));
+        busy = false;
+        return;
+      }
+
+      const data = await res.json();
+      const text = (data.message && data.message.content) ? data.message.content : '';
+      const parsed = parseJson(text);
+      if(parsed && parsed.found){
+        renderOverlay(parsed);
+        setStatus('solved');
+      } else {
+        clearOverlay();
+        setStatus('no problem found');
+      }
+    }catch(e){
+      setStatus('request failed: ' + e.message + ' (check server url + OLLAMA_ORIGINS)');
+    }finally{
+      busy = false;
+    }
+  }
+
+  liveToggle.addEventListener('click', ()=>{
+    live = !live;
+    liveToggle.textContent = 'live: ' + (live ? 'on' : 'off');
+    liveToggle.classList.toggle('active', live);
+    if(live){
+      solveOnce();
+      loopTimer = setInterval(solveOnce, 4000);
+    } else {
+      clearInterval(loopTimer);
+      clearOverlay();
+      setStatus('idle');
+    }
+  });
+})();
+</script>
+</body>
+</html>
