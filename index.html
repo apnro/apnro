@@ -184,7 +184,7 @@
     try{
       if(stream){ stream.getTracks().forEach(t=>t.stop()); }
       stream = await navigator.mediaDevices.getUserMedia({
-        video:{ facingMode:{ ideal:facingMode }, width:{ideal:1280}, height:{ideal:1280} },
+        video:{ facingMode:{ ideal:facingMode }, width:{ideal:1920}, height:{ideal:1920} },
         audio:false
       });
       video.srcObject = stream;
@@ -213,8 +213,32 @@
     if(!w || !h) return null;
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext('2d');
+    ctx.filter = 'contrast(1.25) brightness(1.05)';
     ctx.drawImage(video, 0, 0, w, h);
-    return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+    ctx.filter = 'none';
+    return canvas.toDataURL('image/jpeg', 0.88).split(',')[1];
+  }
+
+  // --- cheap local motion detection, so we only call the (slow) model when the view actually changes ---
+  const diffCanvas = document.createElement('canvas');
+  diffCanvas.width = 24; diffCanvas.height = 18;
+  const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
+  let lastThumb = null;
+  const CHANGE_THRESHOLD = 14; // higher = less sensitive to small movement/hand shake
+
+  function getThumb(){
+    if(!video.videoWidth) return null;
+    diffCtx.drawImage(video, 0, 0, 24, 18);
+    return diffCtx.getImageData(0, 0, 24, 18).data;
+  }
+
+  function thumbDiff(a, b){
+    if(!a || !b) return 999;
+    let sum = 0;
+    for(let i = 0; i < a.length; i += 4){
+      sum += Math.abs(((a[i]+a[i+1]+a[i+2])/3) - ((b[i]+b[i+1]+b[i+2])/3));
+    }
+    return sum / (a.length/4);
   }
 
   function getVideoRect(){
@@ -257,17 +281,22 @@
     busy = true;
     setStatus('solving...');
     try{
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=>controller.abort(), 60000);
       const res = await fetch(serverUrl + '/api/chat', {
         method:'POST',
         headers:{ 'Content-Type':'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           model: modelName,
           stream: false,
           format: 'json',
+          options: { temperature: 0 },
           messages:[{
             role:'user',
             content:
-              "Find the single clearest academic problem (math/science/reading/etc) visible in the image. " +
+              "Look carefully at the image, including any handwriting — read handwritten letters and digits one at a time before deciding what they say, don't guess from shape alone. " +
+              "Find the single clearest academic problem (math/science/reading/etc) visible. " +
               "Reply with ONLY raw JSON, no markdown, no extra text, in exactly this shape: " +
               '{"found":true,"x":0.0,"y":0.0,"answer":"short final answer, under 8 words"} ' +
               "x and y are the fraction (0 to 1) of image width/height for the TOP-LEFT corner of the problem. " +
@@ -276,6 +305,8 @@
           }]
         })
       });
+
+      clearTimeout(timeoutId);
 
       if(!res.ok){
         const errBody = await res.text();
@@ -295,10 +326,27 @@
         setStatus('no problem found');
       }
     }catch(e){
-      setStatus('request failed: ' + e.message + ' (check server url + OLLAMA_ORIGINS)');
+      if(e.name === 'AbortError'){
+        setStatus('timed out after 60s — server may be overloaded, asleep, or the tunnel dropped');
+      } else {
+        setStatus('request failed: ' + e.message + ' (check server url + OLLAMA_ORIGINS)');
+      }
     }finally{
       busy = false;
     }
+  }
+
+  async function checkAndMaybeSolve(){
+    if(busy) return;
+    const thumb = getThumb();
+    if(!thumb) return;
+    if(lastThumb){
+      const d = thumbDiff(thumb, lastThumb);
+      if(d < CHANGE_THRESHOLD) return; // view hasn't changed enough — keep current answer, skip a call
+    }
+    lastThumb = thumb;
+    await solveOnce();
+    lastThumb = getThumb(); // reset baseline to post-solve state
   }
 
   liveToggle.addEventListener('click', ()=>{
@@ -306,11 +354,13 @@
     liveToggle.textContent = 'live: ' + (live ? 'on' : 'off');
     liveToggle.classList.toggle('active', live);
     if(live){
-      solveOnce();
-      loopTimer = setInterval(solveOnce, 4000);
+      lastThumb = null;
+      checkAndMaybeSolve();
+      loopTimer = setInterval(checkAndMaybeSolve, 1000);
     } else {
       clearInterval(loopTimer);
       clearOverlay();
+      lastThumb = null;
       setStatus('idle');
     }
   });
